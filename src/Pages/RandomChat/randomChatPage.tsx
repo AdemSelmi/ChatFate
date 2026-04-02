@@ -12,22 +12,36 @@ const socket: Socket = io(import.meta.env.VITE_SERVER_URL, {
   auth: { userId: currentUserId }
 });
 
-const ICE_SERVERS = {
+// ── ICE config ────────────────────────────────────────────────────────────────
+// Multiple STUN servers + a free TURN from Metered for cross-NAT support.
+// Replace the TURN credentials with your own for production reliability.
+const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.l.google.com:19302'  },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
     {
       urls:       'turn:openrelay.metered.ca:80',
       username:   'openrelayproject',
       credential: 'openrelayproject',
     },
+    {
+      urls:       'turn:openrelay.metered.ca:443',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls:       'turn:openrelay.metered.ca:443?transport=tcp',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 10,
 };
 
-// Four possible states for the partner video panel
 type PartnerStatus = 'searching' | 'connecting' | 'connected' | 'left';
 
-// ── Partner overlay component ─────────────────────────────────────────────────
+// ── Overlay config ────────────────────────────────────────────────────────────
 const OVERLAY_CONFIG: Record<
   Exclude<PartnerStatus, 'connected'>,
   { icon: string; line1: string; line2: string; accent: string; spin: boolean }
@@ -57,66 +71,58 @@ const OVERLAY_CONFIG: Record<
 
 function PartnerOverlay({ status }: { status: PartnerStatus }) {
   if (status === 'connected') return null;
-
   const cfg = OVERLAY_CONFIG[status];
 
   return (
     <div style={{
-      position:       'absolute',
-      inset:          0,
-      display:        'flex',
-      flexDirection:  'column',
-      alignItems:     'center',
-      justifyContent: 'center',
-      gap:            12,
-      background:     'rgba(8, 8, 18, 0.85)',
+      position: 'absolute', inset: 0,
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', gap: 12,
+      background: 'rgba(8, 8, 18, 0.85)',
       backdropFilter: 'blur(8px)',
-      borderRadius:   'inherit',
-      zIndex:         10,
+      borderRadius: 'inherit',
+      zIndex: 10,
     }}>
       {cfg.spin && (
         <div style={{
-          width:            52,
-          height:           52,
-          borderRadius:     '50%',
-          borderWidth:      3,
-          borderStyle:      'solid',
-          borderColor:      `transparent transparent transparent ${cfg.accent}`,
-          animation:        'spin 0.9s linear infinite',
+          width:       52,
+          height:      52,
+          borderRadius: '50%',
+          borderWidth:  3,
+          borderStyle:  'solid',
+          borderColor:  `transparent transparent transparent ${cfg.accent}`,
+          animation:    'spin 0.9s linear infinite',
         }} />
       )}
-
       <span style={{ fontSize: cfg.spin ? 26 : 44, lineHeight: 1 }}>{cfg.icon}</span>
-
-      <p style={{
-        color:      '#fff',
-        fontWeight: 600,
-        fontSize:   15,
-        margin:     0,
-        textAlign:  'center',
-        padding:    '0 16px',
-      }}>
+      <p style={{ color: '#fff', fontWeight: 600, fontSize: 15, margin: 0, textAlign: 'center', padding: '0 16px' }}>
         {cfg.line1}
       </p>
-
-      <p style={{
-        color:     'rgba(255,255,255,0.5)',
-        fontSize:  12,
-        margin:    0,
-        textAlign: 'center',
-        padding:   '0 16px',
-      }}>
+      <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12, margin: 0, textAlign: 'center', padding: '0 16px' }}>
         {cfg.line2}
       </p>
-
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
 
+// ── Safe peer destroy ─────────────────────────────────────────────────────────
+// simple-peer can throw "_readableState undefined" if destroyed while a stream
+// event is in flight. Wrapping destroy() in a try/catch + nextTick prevents this.
+function safePeerDestroy(peer: Instance | null) {
+  if (!peer) return;
+  try {
+    // Remove all listeners first so no callbacks fire after destroy
+    peer.removeAllListeners();
+    // Defer the actual destroy one tick so any in-flight emit finishes
+    setTimeout(() => {
+      try { peer.destroy(); } catch (_) { /* already gone */ }
+    }, 0);
+  } catch (_) { /* already gone */ }
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 function RandomChatPage() {
-  const [stream,         setStream]         = useState<MediaStream | undefined>();
   const [partnerId,      setPartnerId]      = useState('');
   const [randomChatData, setRandomChatData] = useState<any>(null);
   const [callAccepted,   setCallAccepted]   = useState(false);
@@ -130,14 +136,12 @@ function RandomChatPage() {
 
   const iAmInitiatorRef = useRef(false);
   const matchActiveRef  = useRef(false);
-  const randomChatIdRef = useRef<string | null>(null);   // track joined room for cleanup
+  const randomChatIdRef = useRef<string | null>(null);
 
   // ── Peer teardown ─────────────────────────────────────────────────────────
   const destroyPeer = useCallback(() => {
-    if (peerRef.current) {
-      peerRef.current.destroy();
-      peerRef.current = null;
-    }
+    safePeerDestroy(peerRef.current);
+    peerRef.current = null;
     setCallAccepted(false);
     setRemoteStream(null);
     if (userVideo.current) userVideo.current.srcObject = null;
@@ -146,86 +150,128 @@ function RandomChatPage() {
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = undefined;
-    setStream(undefined);
     if (myVideo.current) myVideo.current.srcObject = null;
   }, []);
 
-  // ── Initiator peer (caller) ───────────────────────────────────────────────
-  const startCall = useCallback((targetUserId: string, localStream: MediaStream) => {
-    console.log('[RTC] Starting call → initiator');
-
-    const peer = new Peer({ initiator: true, trickle: false, stream: localStream, config: ICE_SERVERS });
-
-    peer.on('signal', (data: SignalData) => {
-      socket.emit('callUser', { userToCall: targetUserId, signalData: data, from: currentUserId });
+  // ── Build a peer — shared logic ───────────────────────────────────────────
+  // trickle: true  → candidates are sent incrementally as they are discovered,
+  //                  which is far more reliable across different networks / NATs.
+  // With trickle=true the 'signal' event fires multiple times (once for the
+  // offer/answer SDP, then once per ICE candidate), so the server must forward
+  // ALL of them — which your existing callUser / answerCall / callAccepted
+  // events already do correctly.
+  const buildPeer = useCallback((
+    initiator:   boolean,
+    localStream: MediaStream,
+  ): Instance => {
+    return new Peer({
+      initiator,
+      trickle: true,           // ← changed from false; critical for cross-network
+      stream:  localStream,
+      config:  ICE_SERVERS,
     });
+  }, []);
 
-    const onCallAccepted = (signal: SignalData) => {
-      if (peerRef.current && !(peerRef.current as any).destroyed) {
-        peerRef.current.signal(signal);
-      }
-    };
-    socket.once('callAccepted', onCallAccepted);
-
+  // ── Attach common stream/error/close handlers ─────────────────────────────
+  const attachCommonHandlers = useCallback((peer: Instance) => {
     peer.on('stream', (incoming: MediaStream) => {
+      // Guard: if we already destroyed this peer, don't touch state
+      if (peerRef.current !== peer) return;
       setRemoteStream(incoming);
       setCallAccepted(true);
       setPartnerStatus('connected');
     });
 
     peer.on('error', (err: Error) => {
-      console.error('[RTC] Initiator error:', err.message);
-      socket.off('callAccepted', onCallAccepted);
+      // Guard: only log if this peer is still the active one
+      if (peerRef.current !== peer) return;
+      console.error('[RTC] Peer error:', err.message);
     });
-    peer.on('close', () => socket.off('callAccepted', onCallAccepted));
 
-    peerRef.current = peer;
+    peer.on('close', () => {
+      if (peerRef.current !== peer) return;
+      console.log('[RTC] Peer connection closed');
+    });
   }, []);
 
-  // ── Callee peer (receiver) ────────────────────────────────────────────────
-  const receiveCall = useCallback((callerDbId: string, offerSignal: SignalData, localStream: MediaStream) => {
-    console.log('[RTC] Receiving call → callee');
+  // ── Initiator (caller) ────────────────────────────────────────────────────
+  const startCall = useCallback((targetUserId: string, localStream: MediaStream) => {
+    console.log('[RTC] Starting call → initiator (trickle=true)');
 
-    const peer = new Peer({ initiator: false, trickle: false, stream: localStream, config: ICE_SERVERS });
+    const peer = buildPeer(true, localStream);
+    peerRef.current = peer;
 
+    // Each signal event must be forwarded (offer SDP + each ICE candidate)
     peer.on('signal', (data: SignalData) => {
+      if (peerRef.current !== peer) return;
+      console.log('[RTC] Initiator signal:', (data as any).type ?? 'candidate');
+      socket.emit('callUser', {
+        userToCall: targetUserId,
+        signalData: data,
+        from:       currentUserId,
+      });
+    });
+
+    // callAccepted fires once for the answer SDP, then once per ICE candidate
+    const onCallAccepted = (signal: SignalData) => {
+      if (peerRef.current !== peer || (peer as any).destroyed) return;
+      console.log('[RTC] callAccepted signal:', (signal as any).type ?? 'candidate');
+      try { peer.signal(signal); } catch (e) { console.warn('[RTC] signal() after destroy ignored'); }
+    };
+    // Use .on (not .once) because trickle sends multiple signals
+    socket.on('callAccepted', onCallAccepted);
+
+    attachCommonHandlers(peer);
+
+    // Clean up the socket listener when this peer dies
+    peer.on('close', () => socket.off('callAccepted', onCallAccepted));
+    peer.on('error', () => socket.off('callAccepted', onCallAccepted));
+  }, [buildPeer, attachCommonHandlers]);
+
+  // ── Callee (receiver) ─────────────────────────────────────────────────────
+  const receiveCall = useCallback((callerDbId: string, offerSignal: SignalData, localStream: MediaStream) => {
+    console.log('[RTC] Receiving call → callee (trickle=true)');
+
+    const peer = buildPeer(false, localStream);
+    peerRef.current = peer;
+
+    // Each answer SDP + ICE candidate must be sent back
+    peer.on('signal', (data: SignalData) => {
+      if (peerRef.current !== peer) return;
+      console.log('[RTC] Callee signal:', (data as any).type ?? 'candidate');
       socket.emit('answerCall', { signal: data, to: callerDbId });
     });
 
-    peer.on('stream', (incoming: MediaStream) => {
-      setRemoteStream(incoming);
-      setCallAccepted(true);
-      setPartnerStatus('connected');
-    });
+    attachCommonHandlers(peer);
 
-    peer.on('error', (err: Error) => console.error('[RTC] Callee error:', err.message));
-
-    peer.signal(offerSignal);
-    peerRef.current = peer;
-  }, []);
+    // Feed the offer — after all listeners are attached
+    try { peer.signal(offerSignal); } catch (e) { console.warn('[RTC] initial signal() failed:', e); }
+  }, [buildPeer, attachCommonHandlers]);
 
   // ── Bootstrap ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    // Camera / mic
+    // 1. Camera / mic
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then(localStream => {
         streamRef.current = localStream;
-        setStream(localStream);
         if (myVideo.current) myVideo.current.srcObject = localStream;
       })
       .catch(err => console.error('[Media] getUserMedia failed:', err));
 
-    // Match found
+    // 2. Match found
     socket.on('partner_found', (data: any) => {
-      if (matchActiveRef.current) return;
+      if (matchActiveRef.current) {
+        console.warn('[Match] Duplicate partner_found — ignored');
+        return;
+      }
       matchActiveRef.current = true;
 
       const foundPartnerId: string = data.partnerId;
+      console.log('[Match] Partner found! id =', foundPartnerId);
       setPartnerId(foundPartnerId);
       setRandomChatData(data.randomChat);
       setPartnerStatus('connecting');
 
-      // Join the random chat room — server uses this to track us for disconnect events
       if (data.randomChat?._id) {
         randomChatIdRef.current = data.randomChat._id;
         socket.emit('join_random_chat', { randomChatId: data.randomChat._id });
@@ -235,32 +281,49 @@ function RandomChatPage() {
       console.log('[RTC] Role:', iAmInitiatorRef.current ? 'INITIATOR' : 'CALLEE');
 
       if (iAmInitiatorRef.current) {
+        // 800 ms gives the callee time to register its 'callUser' listener
         setTimeout(() => {
-          if (streamRef.current) startCall(foundPartnerId, streamRef.current);
-        }, 600);
+          if (streamRef.current) {
+            startCall(foundPartnerId, streamRef.current);
+          } else {
+            console.error('[RTC] No local stream — cannot start call');
+          }
+        }, 800);
       }
     });
 
-    // Incoming offer — callee only
+    // 3. Incoming offer signals (callee) + trickle ICE candidates from initiator
     socket.on('callUser', (data: { signal: SignalData; from: string }) => {
-      if (iAmInitiatorRef.current) return;
-      if (!streamRef.current)     return;
-      receiveCall(data.from, data.signal, streamRef.current);
+      if (iAmInitiatorRef.current) return; // not for us
+
+      if (!streamRef.current) {
+        console.error('[RTC] No local stream — cannot answer');
+        return;
+      }
+
+      // First callUser event → create the peer and feed the offer
+      // Subsequent callUser events → feed trickle ICE candidates into existing peer
+      if (!peerRef.current) {
+        receiveCall(data.from, data.signal, streamRef.current);
+      } else if (!(peerRef.current as any).destroyed) {
+        console.log('[RTC] Callee feeding trickle candidate');
+        try { peerRef.current.signal(data.signal); } catch (e) { /* ignore post-destroy */ }
+      }
     });
 
-    // Partner left (covers: explicit leave_random_chat AND abrupt disconnect)
+    // 4. Partner left
     socket.on('partner_left', () => {
       console.log('[Socket] Partner left');
       destroyPeer();
       setPartnerId('');
       setRandomChatData(null);
-      setPartnerStatus('left');          // ← shows "Partner left" overlay
+      setPartnerStatus('left');
       randomChatIdRef.current = null;
       matchActiveRef.current  = false;
       iAmInitiatorRef.current = false;
     });
 
-    // Kick off matchmaking
+    // 5. Start matchmaking
     triggerSearch();
 
     return () => {
@@ -269,14 +332,11 @@ function RandomChatPage() {
       socket.off('callAccepted');
       socket.off('partner_left');
 
-      // Tell server we're leaving so partner gets partner_left
       if (randomChatIdRef.current) {
         socket.emit('leave_random_chat', { randomChatId: randomChatIdRef.current });
       }
-      // Also pull us from Redis waiting room if still searching
       fetch(`${import.meta.env.VITE_SERVER_URL}/api/waiting-room`, {
-        method:  'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
+        method: 'DELETE', headers: { Authorization: `Bearer ${token}` },
       }).catch(() => {});
 
       destroyPeer();
@@ -286,18 +346,18 @@ function RandomChatPage() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Attach remote stream to <video> once available
+  // Attach remote stream to <video>
   useEffect(() => {
     if (callAccepted && remoteStream && userVideo.current) {
       userVideo.current.srcObject = remoteStream;
     }
   }, [callAccepted, remoteStream]);
 
-  // ── Matchmaking helper (also used by Skip) ────────────────────────────────
+  // ── Matchmaking trigger ───────────────────────────────────────────────────
   const triggerSearch = () => {
     setPartnerStatus('searching');
     fetch(`${import.meta.env.VITE_SERVER_URL}/api/find-partner`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     })
       .then(r => r.json())
@@ -338,7 +398,6 @@ function RandomChatPage() {
       <div className="screen">
         <div className="cams">
 
-          {/* My video — always visible */}
           <div className="videoscreen">
             <div className="sticker">
               <img src="download.png" alt="" />
@@ -347,13 +406,11 @@ function RandomChatPage() {
             <video autoPlay muted ref={myVideo} />
           </div>
 
-          {/* Partner video — overlaid with status panel until fully connected */}
           <div className="videoscreen second" style={{ position: 'relative', overflow: 'hidden' }}>
             <div className="sticker">
               <img src="download.png" alt="" />
               <span>{callAccepted ? 'Partner' : '…'}</span>
             </div>
-            {/* Video is rendered but hidden until stream is live */}
             <video
               autoPlay
               ref={userVideo}
