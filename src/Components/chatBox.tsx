@@ -13,7 +13,7 @@ const config = {
 
 const serverURL=import.meta.env.VITE_SERVER_URL ;
 
-const ChatBoxComp = ({ type, socket, currentUserId, partnerId, randomChatData, chatId , partnerData }: any) => {
+const ChatBoxComp = ({ type, socket, currentUserId, partnerId, chatData, chatId , partnerData }: any) => {
     const [messages, setMessages] = useState<any[]>([]);
     const [inputText, setInputText] = useState("");
     const [isPartnerTyping, setIsPartnerTyping] = useState(false);
@@ -23,7 +23,7 @@ const ChatBoxComp = ({ type, socket, currentUserId, partnerId, randomChatData, c
 
     const typingTimeoutRef = useRef(null);
 
-    const activeChatId = type === 'random' ? randomChatData?._id : chatId;
+    const activeChatId = type === 'random' ? chatData?._id : chatId;
 
     // IMPORTANT: You need to EMIT the correct event name too!
     const handleInputChange = (e: any) => {
