@@ -123,7 +123,7 @@ const ChatBoxComp = ({ type, socket, currentUserId, partnerId, chatData, chatId 
             });
 
             const url = type === 'random' 
-                ? `http://localhost:3003/api/random-chats/${activeChatId}/messages` 
+                ? `${serverURL}/api/random-chats/${activeChatId}/messages` 
                 : `${serverURL}/api/chats/${activeChatId}/messages`;
             
             await axios.post(url, formData , config);
